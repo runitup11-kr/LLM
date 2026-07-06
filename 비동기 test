@@ -1,0 +1,23 @@
+import random
+import asyncio
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+async def test(num):
+    print(f"{num} is started")
+    await asyncio.sleep(2)
+    foo = random.randint(1, 10); return foo
+
+async def main():
+    print("hello world")
+    result1 = asyncio.create_task(test(1))
+    result2 = asyncio.create_task(test(2))
+    
+    await result1 , result2
+    
+    print(result1.result(), result2.result())
+    
+    
+if __name__ == "__main__":
+        asyncio.run(main()) # 이벤트 루프 생성
