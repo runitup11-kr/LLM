@@ -1,0 +1,183 @@
+"""
+실습 P01: 페르소나 챗봇 (- UI 리디자인 버전)
+
+    - templates/index_v2.html  (새 마크업 구조)
+    - static/style_v2.css      (다크 테마 + 카드/버블 UI로 재설계)
+
+즉, Flask 라우트 함수의 로직 자체는 건드리지 않고, 어떤 템플릿/스타일을
+사용할지(render_template 인자)만 바꿔서 "같은 기능, 다른 화면"을
+보여주는 것이 이 파일의 목적입니다.
+
+바뀐 점 (UI 관점):
+    - 밝은 카드 나열형 UI → 다크 테마 + 글래스모피즘 카드 UI
+    - 페르소나 버튼 목록 → "대화 시작하기" 형태의 단일 시작 카드
+    - 말풍선에 사용자/AI 아바타(이모지) 추가
+    - 입력창을 화면 하단에 고정된 캡슐형 입력창으로 변경
+    - 토큰 사용량을 뱃지(pill) 형태로 표시
+
+바뀌지 않은 점 (기능 관점):
+    - GET /            : 메인 페이지 렌더링
+    - POST /chat        : SSE 스트리밍 응답 (data 형식 동일)
+    - POST /reset       : 대화 히스토리 초기화
+    - PERSONAS 딕셔너리, conversations 저장 구조, 세션 키 조합 방식 모두 동일
+"""
+
+import sys
+
+sys.stdout.reconfigure(encoding="utf-8")
+
+import json
+from flask import Flask, render_template, request, Response, stream_with_context
+from dotenv import load_dotenv
+from anthropic import Anthropic
+
+load_dotenv()
+
+app = Flask(__name__)
+client = Anthropic()
+MODEL = "claude-haiku-4-5-20251001"
+
+# ============================================================
+# 페르소나 정의 
+# ============================================================
+PERSONAS = {
+    "counselor": {
+        "name": "마음 상담사",
+        "description": "일상적인 고민과 감정을 들어주는 다정한 상담사",
+        "system": (
+            # Role: AI가 맡을 역할
+            "당신은 10년 경력의 다정한 심리 상담사입니다. "
+            # Tone: 답변 말투와 분위기
+            "항상 존댓말을 사용하며, 판단하거나 다그치지 않고 상대의 말을 먼저 공감하며 받아들입니다. "
+            "예: '그런 일이 있었군요, 많이 힘드셨겠어요' 처럼 감정을 먼저 반영해 준 뒤에 조언을 이어갑니다. "
+            # Scope: 주로 답할 주제 범위
+            "일상적인 스트레스, 인간관계 고민, 감정 정리에 대한 이야기를 주로 다루며, "
+            "필요하면 생각을 정리할 수 있는 간단한 질문을 되물어봅니다. "
+            # Rules: 답변할 때 지켜야 할 규칙
+            "자신이나 타인을 해치고 싶다는 위기 신호가 보이면 반드시 "
+            "'지금 많이 힘드시겠지만, 전문가의 도움이 꼭 필요해 보여요. "
+            "정신건강 위기상담전화 1577-0199로 연락해 보세요'라고 안내합니다. "
+            "의학적 진단이나 약물 처방 같은 전문 치료 영역은 다루지 않고 반드시 전문의 상담을 권유합니다."
+        ),
+    },
+}
+
+# 세션별 대화 히스토리입니다. 실습용이라 서버 메모리에만 저장합니다.
+conversations: dict[str, list] = {}
+
+
+@app.route("/")
+def index():
+    """새 UI(index_v2.html)로 페르소나 시작 화면과 채팅 UI를 보여줍니다."""
+    return render_template("index_v2.html", personas=PERSONAS)
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    """
+    채팅 API입니다. SSE(Server-Sent Events)로 답변을 실시간 전송합니다.
+    (app6.py와 로직 동일 — UI만 바뀌었을 뿐 이 함수는 그대로입니다.)
+    """
+    data = request.json
+    persona_id = data["persona"]
+    user_message = data["message"]
+    session_id = data.get("session_id", "default")
+
+    conv_key = f"{session_id}_{persona_id}"
+    if conv_key not in conversations:
+        conversations[conv_key] = []
+
+    history = conversations[conv_key]
+    history.append({"role": "user", "content": user_message})
+
+    persona = PERSONAS[persona_id]
+
+    def generate():
+        """스트리밍 응답 생성기. 토큰 조각이 도착하는 대로 즉시 흘려보냅니다."""
+        with client.messages.stream(
+            model=MODEL,
+            max_tokens=1024,
+            system=persona["system"],
+            messages=history,
+        ) as stream:
+            full_response = ""
+            for text in stream.text_stream:
+                full_response += text
+                yield f"data: {json.dumps({'text': text})}\n\n"
+
+            history.append({"role": "assistant", "content": full_response})
+
+            usage = stream.get_final_message().usage
+            yield f"data: {json.dumps({'done': True, 'input_tokens': usage.input_tokens, 'output_tokens': usage.output_tokens})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        content_type="text/event-stream",
+    )
+
+
+@app.route("/reset", methods=["POST"])
+def reset():
+    """현재 페르소나의 대화 히스토리를 초기화합니다."""
+    data = request.json
+    session_id = data.get("session_id", "default")
+    persona_id = data.get("persona", "")
+    conv_key = f"{session_id}_{persona_id}"
+    conversations.pop(conv_key, None)
+    return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    # app6.py(포트 5000)와 동시에 띄워도 충돌하지 않도록 5001번을 사용합니다.
+    app.run(debug=True, port=5001)
+
+
+# ============================================================
+# REST API 명세 (app6.py와 완전히 동일)
+# ============================================================
+#
+# 1. GET /
+#    메인 페이지, 즉 페르소나 시작 화면과 채팅 UI를 반환합니다.
+#
+#    Response: text/html
+#
+# ─────────────────────────────────────────────────────────────
+#
+# 2. POST /chat
+#    사용자 메시지를 받아 Claude 응답을 SSE 스트리밍으로 반환합니다.
+#
+#    Request:
+#      Content-Type: application/json
+#      Body:
+#      {
+#        "persona":    (string, 필수) 페르소나 ID — "counselor"
+#        "message":    (string, 필수) 사용자 메시지
+#        "session_id": (string, 선택) 세션 식별자 (기본값: "default")
+#      }
+#
+#    Response:
+#      Content-Type: text/event-stream
+#      스트리밍 이벤트 (SSE):
+#
+#      [텍스트 청크] — 생성되는 텍스트 조각을 반복 전송
+#        data: {"text": "응답 텍스트 조각"}
+#
+#      [완료] — 스트림 마지막에 1회 전송
+#        data: {"done": true, "input_tokens": 25, "output_tokens": 130}
+#
+# ─────────────────────────────────────────────────────────────
+#
+# 3. POST /reset
+#    특정 페르소나에 쌓인 대화 히스토리를 초기화합니다.
+#
+#    Request:
+#      Content-Type: application/json
+#      Body:
+#      {
+#        "persona":    (string, 필수) 초기화할 페르소나 ID
+#        "session_id": (string, 선택) 세션 식별자 (기본값: "default")
+#      }
+#
+#    Response:
+#      Content-Type: application/json
+#      {"status": "ok"}
